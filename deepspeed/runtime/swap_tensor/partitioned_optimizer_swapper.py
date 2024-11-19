@@ -217,3 +217,57 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
 
         if swap_info.unswapped_gradients:
             self._retrieve_unswapped_grad_partitions(swap_info=swap_info, dest_buffer=parameter.grad)
+
+    def _demand_swap_in_gradients(self, parameter, gradient_offsets, dest_buffer):
+        self.flush_gradients()
+        
+        buffers = []
+        buffers.append(dest_buffer)
+        # self._swap_in_parameter(aio_handle=self.aio_handle,
+        #                         parameter=parameter,
+        #                         dest_buffers=buffers)
+        dist.barrier()
+        swap_info = self.swap_params_info.get(OptimizerSwapper.parameter_id(parameter), None)
+        if not (swap_info and swap_info.has_gradients()):
+            self.get_and_del_else_swapped_gradients(offset=gradient_offsets, grad_buffer=dest_buffer)
+            return
+            
+        assert get_accelerator().is_pinned(dest_buffer)
+        assert parameter.numel() <= dest_buffer.numel()
+        # parameter.grad = dest_buffer.narrow(0, 0, dest_buffer.numel())
+
+        if swap_info.unswapped_gradients:
+            numel = self._retrieve_unswapped_grad_partitions(swap_info=swap_info, dest_buffer=dest_buffer, 
+                                                    dest_offset=gradient_offsets, flag=False)
+
+            if numel > 0:
+                # dest_buffer.copy_(buffers[0], non_blocking=True)
+                # parameter.grad = dest_buffer.narrow(0, 0, parameter.numel())
+                return 
+
+        if swap_info.swapped_gradients:
+            swapable_swap_info = self.swap_params_info[OptimizerSwapper.parameter_id(parameter)]
+            # self._swap_in_pinned_gradients(self.aio_handle, parameter, parameter.grad)
+            param_gradients = swapable_swap_info.swapped_gradients.values()
+            swap_paths = [grad.path for grad in param_gradients if grad.offset == gradient_offsets]
+            if not swap_paths:
+                print("swap_paths not find ")
+                return 
+            # buffers.append(dest_buffer)
+            
+            SWAP_READ_GRADIENTS = 'swap_submit_read_one_gradient'
+            SWAP_WAIT_GRADIENTS = 'swap_submit_wait_one_gradient'
+
+            self._start_timer(SWAP_READ_GRADIENTS)
+            swap_in_tensors(self.aio_handle, buffers, swap_paths)
+            self._stop_timer(SWAP_READ_GRADIENTS)
+            
+            # completed_io = self.aio_handle.wait()
+            
+            self._start_timer(SWAP_WAIT_GRADIENTS)
+            assert len(buffers) == self.aio_handle.wait()
+            self._stop_timer(SWAP_WAIT_GRADIENTS)
+
+            self._log_timers([SWAP_READ_GRADIENTS, SWAP_WAIT_GRADIENTS])
+            # dest_buffer.copy_(buffers[0], non_blocking=True)
+            return 

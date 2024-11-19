@@ -403,8 +403,14 @@ class OptimizerSwapper(object):
 
         return new_tensors, new_offsets
 
-    def _retrieve_unswapped_grad_partitions(self, swap_info, dest_buffer):
+    def _retrieve_unswapped_grad_partitions(self, swap_info, dest_buffer, dest_offset=None, flag=True):
         UNSWAPPED_READ_GRADIENTS = 'unswapped_read_gradients'
+        if not flag:
+            if dest_offset != None and dest_offset in swap_info.unswapped_gradients.keys():
+                dest_buffer.copy_(swap_info.unswapped_gradients[dest_offset], non_blocking=True)
+                return 1
+            else:
+                return 0
         self._start_timer(UNSWAPPED_READ_GRADIENTS)
         tensor_count = len(swap_info.unswapped_gradients)
         num_elem_count = swap_info.read_unswapped_gradients(dest_buffer)
@@ -412,7 +418,10 @@ class OptimizerSwapper(object):
         self._log_timers([UNSWAPPED_READ_GRADIENTS])
 
         # It should be safe to discard unswapped gradient partitions
-        swap_info.release_unswapped_gradients()
+        if flag:
+            swap_info.release_unswapped_gradients()
+        else:
+            pass
 
         if SWAPPER_DEBUG_MODE:
             logger.info(

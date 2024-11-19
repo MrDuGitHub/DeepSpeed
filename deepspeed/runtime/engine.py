@@ -2152,7 +2152,7 @@ class DeepSpeedEngine(Module):
         if hasattr(self.optimizer, "overflow"):
             overflow = self.optimizer.overflow
         self._step_applied = not overflow
-
+        self.optimizer.overflow = False
         if overflow:
             self.skipped_steps += 1
         else:

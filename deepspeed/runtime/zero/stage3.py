@@ -527,17 +527,22 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         all_params = list(itertools.chain.from_iterable(self.fp16_groups))
 
-        self.grad_partitions_flat_buffer: Tensor = torch.zeros(sum(p.partition_numel() for p in all_params),
+        largest_param_numel = max([max([p.ds_numel for p in psg]) for psg in self.fp16_partitioned_groups])
+        self.grad_partitions_flat_buffer: Tensor = torch.zeros(largest_param_numel,
                                                                dtype=self.gradient_accumulation_dtype,
                                                                device=self.device)
+        self.grad_partitions_flat_buffer_32 = get_accelerator().pin_memory(torch.empty(int(largest_param_numel),
+                                                                    dtype=torch.float32,
+                                                                    requires_grad=False),
+                                                        align_bytes=0)
+        
         if self.offload_optimizer_pin_memory:
             self.grad_partitions_flat_buffer = get_accelerator().pin_memory(self.grad_partitions_flat_buffer)
-
-        offset = 0
-        for param in all_params:
-            self.__param_id_to_grad_partition[param.ds_id] = self.grad_partitions_flat_buffer.narrow(
-                0, offset, param.partition_numel())
-            offset += param.partition_numel()
+            
+        self.__param_id_to_grad_partition = self.grad_partitions_flat_buffer.narrow(
+                0, 0, largest_param_numel)
+        self.__param_id_to_grad_partition_32 = self.grad_partitions_flat_buffer_32.narrow(
+                0, 0, largest_param_numel)
 
     def _link_all_hp_params(self):
         for p in self.module.parameters():
@@ -1451,49 +1456,86 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def partition_grads(self, params_to_release: List[Parameter], grad_partitions: List[Tensor]) -> None:
         offload_fp32_gradients = {}
         offload_fp32_offsets = {}
-        buffers = []
         for param, grad_partition in zip(params_to_release, grad_partitions):
-
             contains_real_data = param.partition_numel() * dist.get_rank(self.dp_process_group) < param.ds_numel
             if not contains_real_data:
                 # this grad partition is empty - don't need to do anything
                 param.grad = None
                 continue
-
+            i, dest_offset, num_param = self.grad_position[self.get_param_id(param)]
             # move or accumulate gradient partition to target buffer
-            grad_buffer = self.__param_id_to_grad_partition[param.ds_id].narrow(0, 0, grad_partition.numel())
-            buffers.append(grad_buffer)
+            # grad_buffer = self.__param_id_to_grad_partition[param.ds_id].narrow(0, 0, grad_partition.numel())
+            grad_buffer = self.__param_id_to_grad_partition.narrow(0, 0, grad_partition.numel())
+            grad_buffer_32 = self.__param_id_to_grad_partition_32.narrow(0, 0, grad_partition.numel())
+            grad_buffer.zero_()
+            grad_buffer_32.zero_()
+
             if self.micro_step_id == 0:  # don't accumulate
                 grad_buffer.copy_(grad_partition, non_blocking=True)
-                # ensure grad buffer is a CUDA buffer to speed up the next few
-                # operations and so it can be used asynchronously
                 grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
             elif get_accelerator().on_accelerator(grad_buffer):
+                if self._swappable_optimizer_subgroup(i):
+                    dist.barrier()
+                    self.optimizer_swapper._demand_swap_in_gradients(parameter=self.fp32_partitioned_groups_flat[i], 
+                                                                gradient_offsets=dest_offset, 
+                                                                dest_buffer=grad_buffer_32)
+                else:
+                    fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
+                            0, dest_offset, grad_buffer.numel())
+                    grad_buffer_32.copy_(fp32_grad_tensor)
+                grad_buffer.copy_(grad_buffer_32.half())
                 grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(grad_buffer.shape))
             else:
-                # if dst is CPU, copy first to src device, do the addition
-                # there, then move back to dst. adding directly to cpu is very slow
+                if self._swappable_optimizer_subgroup(i):
+                    dist.barrier()
+                    self.optimizer_swapper._demand_swap_in_gradients(parameter=self.fp32_partitioned_groups_flat[i], 
+                                                                gradient_offsets=dest_offset, 
+                                                                dest_buffer=grad_buffer_32)
+                else:
+                    fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
+                            0, dest_offset, grad_buffer.numel())
+                    grad_buffer_32.copy_(fp32_grad_tensor)
+                    
+                grad_buffer.copy_(grad_buffer_32.half())
+                
                 cuda_grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
                 cuda_grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(cuda_grad_buffer.shape))
                 grad_buffer.copy_(cuda_grad_buffer, non_blocking=True)
-                # ensure grad buffer is a CUDA buffer to speed up the next few
-                # operations and so it can be used asynchronously
                 grad_buffer = cuda_grad_buffer
-
             # offload the gradient partition if applicable
+            dist.barrier()
             if self.offload_optimizer:
                 i, dest_offset, _ = self.grad_position[self.get_param_id(param)]
-
                 if self.is_gradient_accumulation_boundary:
                     self.norm_for_param_grads[self.get_param_id(param)] = self._constant_buffered_norm2(grad_buffer)
-
+                    
+                    if self.dtype == torch.float16 and not self.overflow and (torch.any(torch.isnan(grad_buffer)) or torch.any(torch.isinf(grad_buffer))):
+                        self.tensor_overflow[0] = True
+                    
                     if self._swappable_optimizer_subgroup(i):
                         if not i in offload_fp32_gradients.keys():
                             offload_fp32_gradients[i] = []
                             offload_fp32_offsets[i] = []
-
                         offload_fp32_gradients[i].append(grad_buffer.float())
                         offload_fp32_offsets[i].append(dest_offset)
+                    else:
+                        fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
+                            0, dest_offset, grad_buffer.numel())
+                        fp32_grad_tensor.copy_(grad_buffer)
+
+                else:# gradient_accumulation
+                    if self._swappable_optimizer_subgroup(i):
+                        temp_offload_fp32_offsets = {}
+                        temp_offload_fp32_offsets[i] = []
+                        temp_offload_fp32_offsets[i].append(dest_offset)
+                        
+                        temp_offload_fp32_gradients = {}
+                        temp_offload_fp32_gradients[i] = []
+                        temp_offload_fp32_gradients[i].append(grad_buffer.float())
+                        self.optimizer_swapper.swap_out_gradients(parameter=self.fp32_partitioned_groups_flat[i],
+                                                                gradient_offsets=temp_offload_fp32_offsets[i],
+                                                                gradient_tensors=temp_offload_fp32_gradients[i]) 
+
                     else:
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
@@ -1503,13 +1545,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if not get_accelerator().is_synchronized_device():
                 param.grad.record_stream(get_accelerator().current_stream())
             param.grad = None
-
         if self.offload_optimizer and self.swap_optimizer:
             for i in offload_fp32_gradients.keys():
                 self.optimizer_swapper.swap_out_gradients(parameter=self.fp32_partitioned_groups_flat[i],
                                                           gradient_offsets=offload_fp32_offsets[i],
                                                           gradient_tensors=offload_fp32_gradients[i])
-        return buffers
 
     def reduce_ready_partitions_and_remove_grads(self, param):
         #print_rank_0(f"Backward {debug_param2name_id_shape(param)}", force=True)
