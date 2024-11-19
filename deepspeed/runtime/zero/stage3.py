@@ -2172,8 +2172,33 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if partition_gradients:
             with get_accelerator().stream(self.reduce_and_partition_stream):
                 if hasattr(self.inf_or_nan_tracker, "logical_or_"):
-                    self.inf_or_nan_tracker.logical_or_(torch.isinf(self.grad_partitions_flat_buffer).any())
-                    self.inf_or_nan_tracker.logical_or_(torch.isnan(self.grad_partitions_flat_buffer).any())
+                    chunk_size = int(2.5 * 10**8)
+                    num_elements = self.grad_partitions_flat_buffer.numel()
+                    chunks = (num_elements + chunk_size - 1) // chunk_size  # calculate total chunks
+                    
+                    inf_found = False
+                    nan_found = False
+
+                    for i in range(chunks):
+                        start = int(i * chunk_size)
+                        end = int(min(start + chunk_size, num_elements))
+                        
+                        # Check for Inf values
+                        if torch.isinf(self.grad_partitions_flat_buffer.view(-1)[start:end]).any():
+                            inf_found = True
+
+                        # Check for NaN values
+                        if torch.isnan(self.grad_partitions_flat_buffer.view(-1)[start:end]).any():
+                            nan_found = True
+
+                        # Break early if both Inf and NaN found
+                        if inf_found and nan_found:
+                            break
+                    
+                    self.inf_or_nan_tracker.logical_or_(torch.tensor(inf_found, device=self.grad_partitions_flat_buffer.device))
+                    self.inf_or_nan_tracker.logical_or_(torch.tensor(nan_found, device=self.grad_partitions_flat_buffer.device))
+                    # self.inf_or_nan_tracker.logical_or_(torch.isinf(self.grad_partitions_flat_buffer).any())
+                    # self.inf_or_nan_tracker.logical_or_(torch.isnan(self.grad_partitions_flat_buffer).any())
                 else:
                     # logical_or_ not available in older versions of pytorch
                     self.inf_or_nan_tracker += torch.isinf(self.grad_partitions_flat_buffer).any()
