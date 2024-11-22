@@ -177,6 +177,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.optimizer = init_optimizer
 
+        self.tensor_overflow = torch.zeros(1, dtype=torch.bool)
+        
         # Use torch (un)flatten ops
         self.flatten = _flatten_dense_tensors
         self.unflatten = _unflatten_dense_tensors
@@ -2038,7 +2040,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         # First compute norm for all group so we know if there is overflow
         if self.dtype == torch.float16:
-            self.check_overflow()
+            overflow_gpu = self.tensor_overflow.clone().to(get_accelerator().current_device_name()) 
+            dist.all_reduce(overflow_gpu, op=dist.ReduceOp.MAX)
+            self._model_parallel_all_reduce(tensor=overflow_gpu, op=dist.ReduceOp.MAX)
+            self.overflow = overflow_gpu[0].item()
+            self.tensor_overflow[0] = False
 
         #loss scaling related computation
         prev_scale = self.loss_scale
