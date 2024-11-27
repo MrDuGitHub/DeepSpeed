@@ -793,12 +793,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         for param, partitioned_param in zip(self.fp16_groups[sub_group_id],
                                             self.fp16_partitioned_groups[sub_group_id]):
             dest = flat_buffer.narrow(0, offset, partitioned_param.ds_numel)
+            dist.barrier()
             if partitioned_param.status == PartitionedParamStatus.NOT_AVAILABLE:
                 print_rank_0(
                     f"Swapping in {param.ds_id} with elements {param.ds_numel} and partition {param.partition_numel()}"
                 )
+                dist.barrier()
                 param.nvme_swapper.swap_in([param], async_op=False)
                 dest.data.copy_(partitioned_param.data)
+                dist.barrier()
                 param.nvme_swapper.remove_partition_and_release_buffers([param])
                 print_rank_0(f"Swapping in {param.ds_id} done")
             else:
@@ -864,6 +867,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             ds_id_end = str(self.fp16_partitioned_groups_flat_id[i][-1])
             ds_id = ds_id_begin + '_' + ds_id_end
 
+            dist.barrier()
             # a partition of the fp32 master weights that will be updated by this process
             if self._swappable_optimizer_subgroup(i):
                 self.fp32_partitioned_groups_flat.append(torch.Tensor())
@@ -881,7 +885,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         nvme_fp32_dest_tensors.append(self.fp32_partitioned_groups_flat[i])
                     else:
                         unpinned_fp32_buffer = torch.empty(num_elements, device=self.device, dtype=torch.float)
+                        dist.barrier()
                         self._swap_in_sub_group_to_flat_buffer(unpinned_fp32_buffer, i)
+                        dist.barrier()
                         self.optimizer_swapper.initialize_parameters(parameters=[self.fp32_partitioned_groups_flat[i]],
                                                                      src_tensors=[unpinned_fp32_buffer])
                 else:
@@ -901,9 +907,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     if self.offload_optimizer:
                         self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
                             self.subgroup_to_device[i]).clone().float().detach())
+                        dist.barrier()
                     else:
                         self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
                             self.device).clone().float().detach())
+                        dist.barrier()
                 self.fp32_partitioned_groups_flat[i].ds_id = ds_id
 
             self.fp32_partitioned_groups_flat[i].requires_grad = True  # keep this in case internal optimizer uses it
