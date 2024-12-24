@@ -206,12 +206,13 @@ class OptimizerSwapper(object):
 
         if len(swappable_tensors) > 0:
             if not gradient_swapper.has_buffers():
-                pinned_buffers = self.swap_buffer_manager.allocate_all(num_elems=self.largest_numel, dtype=self.dtype)
+                pinned_buffers = self.swap_buffer_manager.allocate_all(num_elems=self.largest_numel, dtype=torch.float16)
 
                 gradient_swapper.add_buffers(pinned_buffers)
 
             swappable_paths = swap_info.get_or_create_gradient_paths(swappable_offsets, swappable_lengths)
-
+            # print(gradient_swapper.__class__.__name__)
+            # exit()
             gradient_swapper.swap_out_tensors(tensor_list=swappable_tensors, path_list=swappable_paths)
 
         self._stop_timer(SWAP_OUT_GRADIENT_TIMER)

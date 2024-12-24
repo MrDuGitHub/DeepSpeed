@@ -530,20 +530,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         all_params = list(itertools.chain.from_iterable(self.fp16_groups))
 
         largest_param_numel = max([max([p.ds_numel for p in psg]) for psg in self.fp16_partitioned_groups])
-        self.grad_partitions_flat_buffer: Tensor = torch.zeros(largest_param_numel,
-                                                               dtype=self.gradient_accumulation_dtype,
-                                                               device=self.device)
-        self.grad_partitions_flat_buffer_32 = get_accelerator().pin_memory(torch.empty(int(largest_param_numel),
-                                                                    dtype=torch.float32,
-                                                                    requires_grad=False),
-                                                        align_bytes=0)
+        self.grad_partitions_flat_buffer: Tensor = get_accelerator().pin_memory(torch.zeros(largest_param_numel,
+                                                                                    dtype=self.gradient_accumulation_dtype,
+                                                                                    device=self.device))
         
         if self.offload_optimizer_pin_memory:
             self.grad_partitions_flat_buffer = get_accelerator().pin_memory(self.grad_partitions_flat_buffer)
             
         self.__param_id_to_grad_partition = self.grad_partitions_flat_buffer.narrow(
-                0, 0, largest_param_numel)
-        self.__param_id_to_grad_partition_32 = self.grad_partitions_flat_buffer_32.narrow(
                 0, 0, largest_param_numel)
 
     def _link_all_hp_params(self):
@@ -1476,9 +1470,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             # move or accumulate gradient partition to target buffer
             # grad_buffer = self.__param_id_to_grad_partition[param.ds_id].narrow(0, 0, grad_partition.numel())
             grad_buffer = self.__param_id_to_grad_partition.narrow(0, 0, grad_partition.numel())
-            grad_buffer_32 = self.__param_id_to_grad_partition_32.narrow(0, 0, grad_partition.numel())
+            # grad_buffer_32 = self.__param_id_to_grad_partition_32.narrow(0, 0, grad_partition.numel())
             grad_buffer.zero_()
-            grad_buffer_32.zero_()
+            # grad_buffer_32.zero_()
 
             if self.micro_step_id == 0:  # don't accumulate
                 grad_buffer.copy_(grad_partition, non_blocking=True)
@@ -1488,25 +1482,27 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     dist.barrier()
                     self.optimizer_swapper._demand_swap_in_gradients(parameter=self.fp32_partitioned_groups_flat[i], 
                                                                 gradient_offsets=dest_offset, 
-                                                                dest_buffer=grad_buffer_32)
+                                                                dest_buffer=grad_buffer)
                 else:
                     fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
-                    grad_buffer_32.copy_(fp32_grad_tensor)
-                grad_buffer.copy_(grad_buffer_32.half())
+                    # grad_buffer_32.copy_(fp32_grad_tensor)
+                    grad_buffer.copy_(fp32_grad_tensor.half())
+                # grad_buffer.copy_(grad_buffer_32.half())
                 grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(grad_buffer.shape))
             else:
                 if self._swappable_optimizer_subgroup(i):
                     dist.barrier()
                     self.optimizer_swapper._demand_swap_in_gradients(parameter=self.fp32_partitioned_groups_flat[i], 
                                                                 gradient_offsets=dest_offset, 
-                                                                dest_buffer=grad_buffer_32)
+                                                                dest_buffer=grad_buffer)
                 else:
                     fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
-                    grad_buffer_32.copy_(fp32_grad_tensor)
+                    # grad_buffer_32.copy_(fp32_grad_tensor)
+                    grad_buffer.copy_(fp32_grad_tensor.half())
                     
-                grad_buffer.copy_(grad_buffer_32.half())
+                # grad_buffer.copy_(grad_buffer_32.half())
                 
                 cuda_grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
                 cuda_grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(cuda_grad_buffer.shape))
@@ -1526,7 +1522,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         if not i in offload_fp32_gradients.keys():
                             offload_fp32_gradients[i] = []
                             offload_fp32_offsets[i] = []
-                        offload_fp32_gradients[i].append(grad_buffer.float())
+                        offload_fp32_gradients[i].append(grad_buffer)
                         offload_fp32_offsets[i].append(dest_offset)
                     else:
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
@@ -1541,7 +1537,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         
                         temp_offload_fp32_gradients = {}
                         temp_offload_fp32_gradients[i] = []
-                        temp_offload_fp32_gradients[i].append(grad_buffer.float())
+                        temp_offload_fp32_gradients[i].append(grad_buffer)
                         self.optimizer_swapper.swap_out_gradients(parameter=self.fp32_partitioned_groups_flat[i],
                                                                 gradient_offsets=temp_offload_fp32_offsets[i],
                                                                 gradient_tensors=temp_offload_fp32_gradients[i]) 

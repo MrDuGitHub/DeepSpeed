@@ -84,7 +84,7 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
         self.timer_names.add(SWAP_IN_PARAM_TIMER)
 
         self._start_timer(SWAP_IN_GRADIENT_TIMER)
-        self._swap_in_gradients(aio_handle=self.aio_handle, parameter=parameter, dest_buffer=pinned_buffers[-1])
+        self._swap_in_fp16_gradients(aio_handle=self.aio_handle, parameter=parameter, dest_buffer=pinned_buffers[-1])
         self._stop_timer(SWAP_IN_GRADIENT_TIMER)
         self.timer_names.add(SWAP_IN_GRADIENT_TIMER)
 
@@ -217,6 +217,33 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
 
         if swap_info.unswapped_gradients:
             self._retrieve_unswapped_grad_partitions(swap_info=swap_info, dest_buffer=parameter.grad)
+            
+            
+    def _swap_in_fp16_gradients(self, aio_handle, parameter, dest_buffer):
+        swap_info = self.swap_params_info.get(OptimizerSwapper.parameter_id(parameter), None)
+        if not (swap_info and swap_info.has_gradients()):
+            return
+
+        aligned_numel = self._io_aligned_numel(swap_info.numel())
+        pinned_buffers = self.swap_buffer_manager.allocate_fp16(num_elems=aligned_numel,
+                                                           count=1,
+                                                           dtype=torch.float16)
+        
+        
+        assert get_accelerator().is_pinned(dest_buffer)
+        assert parameter.numel() <= dest_buffer.numel()
+
+        fp16_grad = pinned_buffers[0].narrow(0, 0, parameter.numel())
+        parameter.grad = dest_buffer.narrow(0, 0, parameter.numel())
+
+        if swap_info.swapped_gradients:
+            self._swap_in_pinned_gradients(aio_handle, parameter, fp16_grad)
+
+        if swap_info.unswapped_gradients:
+            self._retrieve_unswapped_grad_partitions(swap_info=swap_info, dest_buffer=fp16_grad)
+
+        parameter.grad = fp16_grad.float()
+        self.swap_buffer_manager.free(pinned_buffers)
 
     def _demand_swap_in_gradients(self, parameter, gradient_offsets, dest_buffer):
         self.flush_gradients()

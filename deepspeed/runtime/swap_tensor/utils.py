@@ -187,8 +187,14 @@ class SwapBufferManager(object):
             get_accelerator().pin_memory(torch.zeros(num_elems, device='cpu', dtype=dtype), align_bytes=0)
             for _ in range(count)
         ]
+        self.grad_fp16_buffers = [
+            get_accelerator().pin_memory(torch.zeros(num_elems, device='cpu', dtype=torch.float16), align_bytes=0)
+            for _ in range(count)
+        ]
         self.free_buffer_index = [i for i in range(count)]
+        self.free_fp16_buffer_index = [i for i in range(count)]
         self.used_buffer_index = {}
+        self.used_fp16_buffer_index = {}
         self.gigabytes = (self.all_buffers[0].element_size() * num_elems * count) / (1024**3)
 
         if dist.get_rank() == 0:
@@ -210,20 +216,44 @@ class SwapBufferManager(object):
             buffers.append(tmp_buffer)
             self.used_buffer_index[id(tmp_buffer)] = i
         return buffers
+    
+    def allocate_fp16(self, num_elems, count, dtype):
+        assert dtype == torch.float16
+        assert num_elems <= self.num_elems
+        if count > len(self.free_fp16_buffer_index):
+            return None
+
+        used_indices = self.free_fp16_buffer_index[-count:]
+        self.free_fp16_buffer_index = self.free_fp16_buffer_index[:-count]
+
+        buffers = []
+        for i in used_indices:
+            tmp_buffer = self.grad_fp16_buffers[i].narrow(0, 0, num_elems)
+            buffers.append(tmp_buffer)
+            self.used_fp16_buffer_index[id(tmp_buffer)] = i
+        return buffers
 
     def allocate_all(self, num_elems, dtype):
-        return self.allocate(num_elems=num_elems, count=len(self.free_buffer_index), dtype=dtype)
+        if dtype == torch.float16:
+            return self.allocate_fp16(num_elems=num_elems, count=len(self.free_buffer_index), dtype=dtype)
+        else:
+            return self.allocate(num_elems=num_elems, count=len(self.free_buffer_index), dtype=dtype)
 
     def free(self, buffers):
         buffer_ids = []
         for buf in buffers:
             buffer_ids.append(id(buf))
-
-        assert all([b_id in self.used_buffer_index for b_id in buffer_ids])
-
-        for b_id in buffer_ids:
-            self.free_buffer_index.append(self.used_buffer_index[b_id])
-            del (self.used_buffer_index[b_id])
+        print(buffers[0].dtype)
+        if buffers[0].dtype == torch.float16:
+            assert all([b_id in self.used_fp16_buffer_index for b_id in buffer_ids])
+            for b_id in buffer_ids:
+                self.free_fp16_buffer_index.append(self.used_fp16_buffer_index[b_id])
+                del (self.used_fp16_buffer_index[b_id])
+        else:
+            assert all([b_id in self.used_buffer_index for b_id in buffer_ids])
+            for b_id in buffer_ids:
+                self.free_buffer_index.append(self.used_buffer_index[b_id])
+                del (self.used_buffer_index[b_id])
 
 
 def get_sized_buffer(buffer, num_elems):
