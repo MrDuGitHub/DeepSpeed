@@ -552,7 +552,13 @@ class PartitionedParameterCoordinator:
                     or len(swap_in_params) >= param.nvme_swapper.available_swap_in_buffers()):
                 break
             if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
-                swap_in_params.append(param)
+                flag=0
+                for p in swap_in_params:
+                    if p.ds_id == param.ds_id:
+                        flag=1
+                        break       
+                if flag == 0:            
+                    swap_in_params.append(param)
             numel_considered += param.ds_numel
 
         if swap_in_params:

@@ -736,37 +736,49 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             # We need to keep the reference to this buffer to make sure you can free it in `offload_states`
             self.lp_param_buffer = __class__.defragment(parameter_partitions)
             self._set_fp16_partitioned_groups_flat()
-
+        
+        #只会执行else语句，因为self.offload_param为true
         else:  # partitioned params offloaded to CPU when not in use
             # create a flat CPU memory allocation for each param group
             self._create_param_groups_fp16_flat_cpu_memory()
             for param_group_idx, param_group in enumerate(param_groups):
                 flat_offset = 0
+                flag=1
                 for i, sub_group in enumerate(param_group):
                     total_elements = sum(p.partition_numel() for p in sub_group)
-                    print_rank_0(f"Params in nvme and cpu {self.params_in_nvme_and_cpu}")
-                    #Flat buffer may not be available for parameters that reside in NVME
-                    if not self.params_in_nvme_and_cpu or flat_offset + total_elements <= self.param_groups_fp16_flat_cpu_memory[
-                            param_group_idx].numel():
-                        fp16_partitioned_group_flat = self.param_groups_fp16_flat_cpu_memory[param_group_idx].narrow(
-                            0, flat_offset, total_elements)
-                        print_rank_0(
-                            f"Creating a flat buffer for subgroup {i} requiring {total_elements} elements, and cumulative CPU elements {flat_offset + total_elements}",
-                            force=False)
+                    if flag==1:
+                        if len(sub_group)!=1:
+                            flag=0
+                        print_rank_0(f"Params in nvme and cpu {self.params_in_nvme_and_cpu}")
+                        #Flat buffer may not be available for parameters that reside in NVME
+                        if not self.params_in_nvme_and_cpu or flat_offset + total_elements <= self.param_groups_fp16_flat_cpu_memory[
+                                param_group_idx].numel():
+                            fp16_partitioned_group_flat = self.param_groups_fp16_flat_cpu_memory[param_group_idx].narrow(
+                                0, flat_offset, total_elements)
+                            print_rank_0(
+                                f"Creating a flat buffer for subgroup {i} requiring {total_elements} elements, and cumulative CPU elements {flat_offset + total_elements}",
+                                force=False)
 
-                    elif self.params_in_nvme_and_cpu:
-                        fp16_partitioned_group_flat = None
-                        print_rank_0(f"No flat buffer for sub group {i} of {total_elements} elements", force=False)
+                        elif self.params_in_nvme_and_cpu:
+                            fp16_partitioned_group_flat = None
+                            print_rank_0(f"No flat buffer for sub group {i} of {total_elements} elements", force=False)
+                        else:
+                            assert False, "Either params are in nvme, or they are in CPU memory. This code path should not be triggered. Please see you max_params_in_cpu and params_in_nvme configs"
+
+                        self.fp16_partitioned_groups_flat.append(fp16_partitioned_group_flat)
+                        flat_offset += total_elements
+
+                        self._move_to_flat_buffer(sub_group,
+                                                fp16_partitioned_group_flat,
+                                                avoid_copy=not self.offload_param)
                     else:
-                        assert False, "Either params are in nvme, or they are in CPU memory. This code path should not be triggered. Please see you max_params_in_cpu and params_in_nvme configs"
-
-                    self.fp16_partitioned_groups_flat.append(fp16_partitioned_group_flat)
-                    flat_offset += total_elements
-
-                    self._move_to_flat_buffer(sub_group,
-                                              fp16_partitioned_group_flat,
-                                              avoid_copy=not self.offload_param)
-
+                        flag=1
+                        fp16_partitioned_group_flat = None
+                        self.fp16_partitioned_groups_flat.append(fp16_partitioned_group_flat)
+                        flat_offset += total_elements
+                        self._move_to_flat_buffer(sub_group,
+                                                fp16_partitioned_group_flat,
+                                                avoid_copy=not self.offload_param)
         # if necessary, create a pinned memory buffer to be used for swapping out
         # params to NVME after optimizer step
         should_create_fp16_flat_reuse_buffer = any(flattened_partition_group is None
@@ -2066,6 +2078,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         """
             Not supporting closure.
         """
+        from datetime import datetime
+        time_now = datetime.now()
+        print(f'start step {time_now}\n',end = '')
         self._pre_step()
         self._partition_all_parameters()
 
@@ -2125,6 +2140,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     "that all ranks flush their caches at the same time",
                     alloc_retries - self.n_caching_allocator_flushes)
             self.n_caching_allocator_flushes = alloc_retries
+        time_now = datetime.now()
+        print(f'end step {time_now}\n',end = '')
 
     def dump_pre_step_gradients(self, debug_fp32_grads):
         # Dump gradient norms for debugging
@@ -2251,6 +2268,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         2. scaled_loss = fp32_loss*loss_scale
         3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
         """
+        from datetime import datetime
+        time_now = datetime.now()
+        print(f'start backward {time_now} \n',end = '')
         if self.swap_optimizer:
             self.optimizer_swapper.pre_backward()
 
@@ -2264,6 +2284,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if self.swap_optimizer:
             self.optimizer_swapper.post_backward()
+        time_now = datetime.now()
+        print(f'end backward {time_now}\n',end = '')
 
     def get_fp32_grad_partitions(self) -> Dict[int, Dict[int, Tensor]]:
         """get fp32 gradient partition dictionary

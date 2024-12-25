@@ -2013,7 +2013,7 @@ class DeepSpeedEngine(Module):
         """
 
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
-
+        print("开始进行engine中的backward")
         if self.scale_wrt_gas is not None:
             scale_wrt_gas = self.scale_wrt_gas
 

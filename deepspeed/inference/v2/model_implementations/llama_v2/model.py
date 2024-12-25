@@ -197,7 +197,6 @@ class Llama2InferenceModel(DSTransformerModelBase):
             return logits
 
     def forward(self, wrapped_batch: RaggedBatchWrapper) -> torch.Tensor:
-
         residual = self._forward_embed(wrapped_batch)
 
         residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)

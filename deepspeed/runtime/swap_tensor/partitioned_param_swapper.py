@@ -25,11 +25,14 @@ def print_rank_0(message, debug=False, force=False):
 
 class PartitionedParamStatus(Enum):
     # Partitioned parameters are present and ready for use
+    #分片参数已经准备好，可以使用
     AVAILABLE = 1
 
     # partitioned params are in some non-memory device
+    # 分片参数不在当前设备的内存中，需要加载
     NOT_AVAILABLE = 2
 
+    # 分片参数正在从外部设备（如磁盘或远程存储）加载到内存中
     # partitioned params are being read from some non-memory device.
     INFLIGHT = 3
 
@@ -42,7 +45,6 @@ class AsyncPartitionedParameterSwapper(object):
 
         #set swap buffers, create aio handles
         self._configure_aio(ds_config)
-
         #mapping from param id to path
         self.id_to_path = {}
 
@@ -115,7 +117,6 @@ class AsyncPartitionedParameterSwapper(object):
         self.aio_write_handle = self.aio_handle(self.aio_config[AIO_BLOCK_SIZE], self.aio_config[AIO_QUEUE_DEPTH],
                                                 self.aio_config[AIO_SINGLE_SUBMIT],
                                                 self.aio_config[AIO_OVERLAP_EVENTS], self.aio_config[AIO_THREAD_COUNT])
-
         if self.use_gds:
             self.buffers = torch.empty(int(self.aligned_elements_per_buffer * self.param_buffer_count),
                                        dtype=self.dtype,
@@ -123,14 +124,26 @@ class AsyncPartitionedParameterSwapper(object):
                                        requires_grad=False)
             self.aio_read_handle.pin_device_tensor(self.buffers)
         else:
+            # print("get_accelerator() = ", get_accelerator())
+            # import time
+            # time.sleep(10)
+            # self.buffers = get_accelerator().pin_memory(torch.empty(int(self.aligned_elements_per_buffer *
+            #                                                             self.param_buffer_count),
+            #                                                         dtype=self.dtype,
+            #                                                         requires_grad=False),
+            #                                             align_bytes=0)
             self.buffers = get_accelerator().pin_memory(torch.empty(int(self.aligned_elements_per_buffer *
                                                                         self.param_buffer_count),
                                                                     dtype=self.dtype,
                                                                     requires_grad=False),
                                                         align_bytes=0)
-
+            # tensor = torch.ones(int(self.aligned_elements_per_buffer * self.param_buffer_count), dtype=torch.float16, requires_grad=False)
+            print("Alloc %d * %d %s for _configure_aio" % (self.aligned_elements_per_buffer, self.param_buffer_count, self.dtype))
+            # time.sleep(10)
+            # exit()
         self.swap_out_params = []
-
+        # print(self.aligned_elements_per_buffer,self.param_buffer_count)
+        # exit()
     #Check if partitioned param or numel in a tensor is swappable or not
     def swappable_tensor(self, param=None, numel=None):
         if param is not None:
@@ -144,7 +157,7 @@ class AsyncPartitionedParameterSwapper(object):
         paths = self._get_swap_paths([param], must_exist=must_exist)
         return paths[0]
 
-    def _get_swap_paths(self, params, must_exist=False):
+    def _get_swap_paths(self, params, must_exist=False):#返回一个列表，该列表存储每个参数的交换路径（即参数要被放在磁盘的哪个文件）
         paths = []
         for param in params:
             param_id = param.ds_id
@@ -152,14 +165,14 @@ class AsyncPartitionedParameterSwapper(object):
                 param_path = self.id_to_path[param_id]
             else:
                 assert not must_exist, f"Path for param id {param_id} does not exist"
-                param_path = os.path.join(self.swap_folder, f'{param_id}_param.tensor.swp')
+                param_path = os.path.join(self.swap_folder, f'{param_id}_param.tensor.swp')#创建一个新的路径 param_path，它由 self.swap_folder 和 param_id 组成，路径的格式为 {param_id}_param.tensor.swp。这通常指的是存储在 swap_folder 目录下的一个交换文件。
 
-                self.id_to_path[param_id] = param_path
+                self.id_to_path[param_id] = param_path#将新生成的路径存储到 self.id_to_path 字典中，以便下次直接使用
             paths.append(param_path)
 
         return paths
 
-    def _get_swap_buffers(self, params):
+    def _get_swap_buffers(self, params):#返回每个参数对应的缓冲区id列表
         buffers = []
         for param in params:
             param_id = param.ds_id
@@ -178,6 +191,13 @@ class AsyncPartitionedParameterSwapper(object):
         compute_buffers = []
         swap_buffers = []
 
+        # 初始化交换缓冲区指针，用于跟踪当前缓冲区的使用情况
+        if not hasattr(self, "current_buffer_id"):
+            self.current_buffer_id = None
+            self.current_buffer_offset = 0
+            # 初始化字典，键是 0 到 param_buffer_count-1，值都是 aligned_elements_per_buffer
+            self.my_dict = {i: self.aligned_elements_per_buffer for i in range(self.param_buffer_count)}
+
         for param in params:
             param_id = param.ds_id
             assert param_id in self.param_id_to_numel.keys(), f" Number of elements in param {param_id} is unknown"
@@ -186,13 +206,29 @@ class AsyncPartitionedParameterSwapper(object):
             assert param_id not in self.param_id_to_swap_buffer.keys(
             ), f"param {param_id} has already been assigned a swap buffer"
 
-            buffer_id = self.available_buffer_ids.pop()
-            print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}  ")
-            self.param_id_to_buffer_id[param_id] = buffer_id
-            aligned_swap_numel = self._io_aligned_numel(self.param_id_to_numel[param_id])
-            swap_buffer = self.buffers.narrow(0, int(buffer_id * self.aligned_elements_per_buffer), aligned_swap_numel)
 
+            aligned_swap_numel = self._io_aligned_numel(self.param_id_to_numel[param_id])
+
+            # 检查是否需要分配新的交换缓冲区
+            if self.current_buffer_id is None or (self.current_buffer_offset + aligned_swap_numel > self.aligned_elements_per_buffer):
+                # 分配新的缓冲区
+                self.current_buffer_id = self.available_buffer_ids.pop()
+                self.current_buffer_offset = 0  # 重置偏移量
+                print_rank_0(f"分配新的交换缓冲区 ID {self.current_buffer_id}")
+            
+            if self.current_buffer_id in self.available_buffer_ids:
+                self.available_buffer_ids.remove(self.current_buffer_id)
+
+            # 获取交换缓冲区的起始位置并计算当前参数的交换缓冲区
+            swap_buffer_start = int(self.current_buffer_id * self.aligned_elements_per_buffer + self.current_buffer_offset)
+            swap_buffer = self.buffers.narrow(0, swap_buffer_start, aligned_swap_numel)
+            self.my_dict[self.current_buffer_id]-=aligned_swap_numel
+            # 更新偏移量并记录
+            self.current_buffer_offset += aligned_swap_numel
+            self.param_id_to_buffer_id[param_id] = self.current_buffer_id
             self.param_id_to_swap_buffer[param_id] = swap_buffer
+
+            # 获取计算缓冲区（实际大小）并添加到列表
             compute_buffer = swap_buffer.narrow(0, 0, self.param_id_to_numel[param_id])
             compute_buffers.append(compute_buffer)
             swap_buffers.append(swap_buffer)
@@ -200,31 +236,35 @@ class AsyncPartitionedParameterSwapper(object):
         return compute_buffers, swap_buffers
 
     #waits for inflight nvme write to complete
-    def synchronize_writes(self):
+    def synchronize_writes(self):#用于确保当前所有正在进行的 NVMe 写操作（通常是将数据写入外部存储，如 SSD）完成
         if self.pending_writes == 0:
             return
-        assert self.pending_writes == self.aio_write_handle.wait()
+        assert self.pending_writes == self.aio_write_handle.wait()#调用c++aio那块代码的wait函数
         self.pending_writes = 0
-        self.remove_partition_and_release_buffers(self.swap_out_params)
+        self.remove_partition_and_release_buffers(self.swap_out_params)#在逻辑上移除该参数对应的缓冲区（逻辑上移除，具体的释放内存操作目前还没找到）
         self.swap_out_params = []
 
     #waits for inflight nvme reads to complete
-    def synchronize_reads(self):
+    
+    def synchronize_reads(self):#用于同步当前的读操作，确保从外部存储中读取的参数数据已成功加载到内存中
         if self.pending_reads == 0:
             return
-
-        assert self.pending_reads == self.aio_read_handle.wait()
-
+        # print("synchronize_reads",self.inflight_params)
+        # dist.barrier()
+        assert self.pending_reads == self.aio_read_handle.wait()#调用 self.aio_read_handle.wait() 等待所有挂起的读操作完成（c++的io代码）
+        # print("synchronize_reads",self.inflight_params)
+        # dist.barrier()
         self.pending_reads = 0
-
+        # print("synchronize_reads",self.inflight_params.ds_id)
+        # dist.barrier()
         for param, swap_in_buffer in zip(self.inflight_params, self.inflight_swap_in_buffers):
             param_id = param.ds_id
             compute_buffer = swap_in_buffer.narrow(0, 0, self.param_id_to_numel[param_id])
-            param.ds_tensor.data = compute_buffer.data
-            param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
+            param.ds_tensor.data = compute_buffer.data#将提取的缓冲区数据 compute_buffer.data 赋值给 param.ds_tensor.data，将具体的参数数据赋值给该参数对象
+            param.ds_tensor.status = PartitionedParamStatus.AVAILABLE#将参数分片的状态更新为 PartitionedParamStatus.AVAILABLE，表示该参数分片已到达内存
 
         self.available_params.update([param.ds_id for param in self.inflight_params])
-        self.available_numel += self.inflight_numel
+        self.available_numel += self.inflight_numel#inflight表示正在处理中
 
         self.inflight_params = []
         self.inflight_swap_in_buffers = []
@@ -232,41 +272,71 @@ class AsyncPartitionedParameterSwapper(object):
 
     #Removes the memory assignment and releases the buffers
     #Should only be executed after swapping out the tensors
-    def remove_partition_and_release_buffers(self, params):
-        for param in params:
-            param_id = param.ds_id
+    def remove_partition_and_release_buffers(self, params):#将参数标记为不可用，并移除该参数对应的缓冲区（逻辑上移除，具体的释放内存操作目前还没找到）
+            if not hasattr(self, "current_buffer_id"):
+                for param in params:
+                    param_id = param.ds_id
 
-            if param_id in self.param_id_to_buffer_id.keys():
+                    if param_id in self.param_id_to_buffer_id.keys():
 
-                buffer_id = self.param_id_to_buffer_id[param_id]
+                        buffer_id = self.param_id_to_buffer_id[param_id]
 
-                assert buffer_id is not None, "Missing buffer id for releasing"
+                        assert buffer_id is not None, "Missing buffer id for releasing"
 
-                self.available_buffer_ids.append(buffer_id)
-                del self.param_id_to_buffer_id[param_id]
-                del self.param_id_to_swap_buffer[param_id]
-                print_rank_0(f"param {param.ds_id} releases buffer id {buffer_id}  ")
 
-                if param_id in self.available_params:
-                    self.available_params.remove(param_id)
-                    self.available_numel -= self.param_id_to_numel[param_id]
+                        self.available_buffer_ids.append(buffer_id)
+                        
+                        del self.param_id_to_buffer_id[param_id]
+                        del self.param_id_to_swap_buffer[param_id]
+                        print_rank_0(f"param {param.ds_id} releases buffer id {buffer_id}  ")
 
-            param.ds_tensor.data = self.invalid_buffer.data
-            param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
+                        if param_id in self.available_params:
+                            self.available_params.remove(param_id)
+                            self.available_numel -= self.param_id_to_numel[param_id]
+
+                    param.ds_tensor.data = self.invalid_buffer.data
+                    param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
+            else:
+                for param in params:
+                    param_id = param.ds_id
+
+                    if param_id in self.param_id_to_buffer_id.keys():
+
+                        buffer_id = self.param_id_to_buffer_id[param_id]
+
+                        aligned_swap_numel = self._io_aligned_numel(self.param_id_to_numel[param_id])
+
+                        assert buffer_id is not None, "Missing buffer id for releasing"
+        
+                        self.my_dict[buffer_id]+=aligned_swap_numel
+
+                        if self.my_dict[buffer_id]==self.aligned_elements_per_buffer:
+                            self.available_buffer_ids.append(buffer_id)
+
+                        del self.param_id_to_buffer_id[param_id]
+                        del self.param_id_to_swap_buffer[param_id]
+                        print_rank_0(f"param {param.ds_id} releases buffer id {buffer_id}  ")
+
+                        if param_id in self.available_params:
+                            self.available_params.remove(param_id)
+                            self.available_numel -= self.param_id_to_numel[param_id]
+
+                    param.ds_tensor.data = self.invalid_buffer.data
+                    param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
 
     #writes from in memory to nvme. Does not release the buffers
-    def _swap_out(self, params, async_op=True):
-
-        swap_out_paths = self._get_swap_paths(params)
-        swap_out_params = self._get_swap_buffers(params)
+    def _swap_out(self, params, async_op=True):#swap_out是换出的意思，指将内存的数据转移到硬盘的交换区
+        # print("_swap_out")
+        swap_out_paths = self._get_swap_paths(params)#获取每个参数的交换路径，即这些参数将在外部存储中的存放位置
+        swap_out_params = self._get_swap_buffers(params)#获取每个参数对应的缓冲区
         self._track_numel(params)
 
         swap_out_tensors(self.aio_write_handle, swap_out_params, swap_out_paths)
 
-        self.pending_writes += len(swap_out_params)
+        self.pending_writes += len(swap_out_params)#累加当前写操作的参数数量，表示还有多少写操作正在挂起，以便稍后检查它们的完成情况。
         self.swap_out_params += params
 
-        if not async_op:
+        if not async_op:#如果 async_op 为 False（即同步操作），则调用 self.synchronize_writes()去执行wait函数，等待所有挂起的写操作完成。
             self.synchronize_writes()
 
     #blocking swap out followed by releasing the memory buffers
@@ -276,19 +346,19 @@ class AsyncPartitionedParameterSwapper(object):
         self._swap_out(params, async_op=async_op)
 
     # book keeping function for inflight swap in
-    def _update_inflight_swap_in(self, params, swap_in_buffers, inflight_numel):
+    def _update_inflight_swap_in(self, params, swap_in_buffers, inflight_numel):#更新正在进行的交换入操作的状态,即读操作的状态
         self.inflight_params.extend(params)
         self.inflight_swap_in_buffers.extend(swap_in_buffers)
         self.inflight_numel += inflight_numel
 
         for param in params:
-            param.ds_tensor.status = PartitionedParamStatus.INFLIGHT
+            param.ds_tensor.status = PartitionedParamStatus.INFLIGHT#将状态设置正在读入中
 
-        self.pending_reads += len(params)
+
+        self.pending_reads += len(params)#增加 self.pending_reads 的计数，表示当前有多少个读取操作是挂起状态
 
     #assigns an in memory buffer and swaps in from nvme
-    def swap_in(self, params, async_op=True, swap_in_buffers=None):
-
+    def swap_in(self, params, async_op=True, swap_in_buffers=None):#swap_in是换入的意思，指将磁盘交换区的数据换进内存，即读操作，该函数用于将多个参数的数据从磁盘交换区读取到内存中的可用缓冲区，支持异步和同步操作，通过 async_op 参数控制。
         assert all([param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
                     for param in params]), "Some params are already available or in flight"
         swap_in_paths = self._get_swap_paths(params)
@@ -306,28 +376,30 @@ class AsyncPartitionedParameterSwapper(object):
                     f'Num available params: count = {len(self.available_params)}, ids = {self.available_params}, numel = {self.available_numel}',
                     force=True)
 
-            assert len(swap_in_paths) <= len(
-                self.available_buffer_ids
-            ), f"Not enough buffers {len(self.available_buffer_ids)} for swapping {len(swap_in_paths)}"
+            # assert len(swap_in_paths) <= len(
+            #     self.available_buffer_ids
+            # ), f"Not enough buffers {len(self.available_buffer_ids)} for swapping {len(swap_in_paths)}"
             compute_buffers, swap_in_buffers = self._allocate_and_return_buffers_for_swap_in(params)
             inflight_numel = sum([t.numel() for t in compute_buffers])
         else:
             inflight_numel = sum([t.numel() for t in swap_in_buffers])
 
-        swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
+        swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)##调用c++函数将该参数分片从硬盘读到内存
+        self._update_inflight_swap_in(params, swap_in_buffers, inflight_numel)#更新该参数分片状态为正在处理中,即正在从硬盘读到内存
+        
 
-        self._update_inflight_swap_in(params, swap_in_buffers, inflight_numel)
-
-        if not async_op:
+        if not async_op:#如果是同步读取，则调用c++wait等待，直到参数读取完成
             self.synchronize_reads()
 
     # Enables swapping into buffer that is out the control of swapper. This is always synchronous
-    def swap_into_buffer(self, param, dest_buffer):
+    def swap_into_buffer(self, param, dest_buffer):#该函数用于将单个参数的数据交换到一个指定的缓冲区，该方法总是同步执行，不支持异步操作。
+        # print("swap_into_buffer")
         assert param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE, f"param {param.ds_id} is already available or inflight"
 
         require_swap_buffer = not (get_accelerator().is_pinned(dest_buffer)
                                    and self._is_io_aligned(dest_buffer.numel()))
-
+        # print("swap_into_buffer",param)
+        # dist.barrier()
         if require_swap_buffer:
             assert len(self.available_buffer_ids) > 0, f"No buffer available to swap param {param.ds_id}."
             compute_buffers, swap_in_buffers = self._allocate_and_return_buffers_for_swap_in([param])
@@ -335,20 +407,21 @@ class AsyncPartitionedParameterSwapper(object):
         else:
             swap_in_buffers = [dest_buffer]
             inflight_numel = dest_buffer.numel()
-
+            # print("swap_into_buffer",param.ds_id)
+            # dist.barrier()
         swap_in_paths = self._get_swap_paths([param])
-
-        swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
+        swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)#调用c++函数将数据从硬盘读到内存
         self._update_inflight_swap_in([param], swap_in_buffers, inflight_numel)
-        self.synchronize_reads()
-
+        
+        self.synchronize_reads()#用于同步当前的读操作，确保从外部存储中读取的参数数据已成功加载到内存中
+        # dist.barrier()
         if require_swap_buffer:
             dest_buffer.data.copy_(param.ds_tensor.data)
             # Release swap buffer memory assignment. Note, this will mark the parameter not available.
             self.remove_partition_and_release_buffers([param])
 
     #assign a buffer to a param and return the buffer
-    def get_buffer(self, param, numel):
+    def get_buffer(self, param, numel):#为每个参数分配一个计算缓冲区并返回该缓冲区
         param_id = param.ds_id
 
         assert self.available_swap_in_buffers(
@@ -366,7 +439,7 @@ class AsyncPartitionedParameterSwapper(object):
         print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}")
         return compute_buffer
 
-    def reserve_available_buffers(self):
+    def reserve_available_buffers(self):#预定缓冲区
         buffers = []
         for id in self.available_buffer_ids:
             buffers.append(
@@ -389,30 +462,49 @@ class AsyncPartitionedParameterSwapper(object):
     def _is_io_aligned(self, numel):
         return (numel % self.numel_alignment) == 0
 
-    def reserve_partitioned_swap_space(self, partition_num_elems):
+    def reserve_partitioned_swap_space(self, partition_num_elems):##预定分区交换缓冲区
         aligned_numel = sum([self._io_aligned_numel(numel) for numel in partition_num_elems])
+        # aligned_numel = partition_num_elems
         self.partitioned_swap_buffer = get_accelerator().pin_memory(torch.zeros(aligned_numel,
                                                                                 device='cpu',
                                                                                 dtype=self.dtype),
                                                                     align_bytes=0)
+        # import time
+        # time.sleep(10)
+        # self.partitioned_swap_buffer = get_accelerator().pin_memory(torch.empty(aligned_numel,
+        #                                                                         device='cpu',
+        #                                                                         dtype=self.dtype),
+        #                                                             align_bytes=0)
+        # print("for numel in partition_num_elems]",[self._io_aligned_numel(numel) for numel in partition_num_elems])
+        print("Alloc %d %s for reserve_partitioned_swap_space" % (aligned_numel, self.dtype))
+        # time.sleep(10)
+        # exit()
         self.partitioned_swap_pool = SwapBufferPool([self.partitioned_swap_buffer])
-
-    def swap_out_partitioned_params(self, dst_fp16_params, src_fp32_params):
+        
+    def swap_out_partitioned_params(self, dst_fp16_params, src_fp32_params):#将交换池中的数据（即 FP32 数据）写入到磁盘上为 FP16 参数预留的存储位置。
+        #print("swap_out_partitioned_params")
         assert self.partitioned_swap_buffer is not None, f'partitioned swap buffers for fp16 params not initialized'
         assert self.partitioned_swap_pool is not None, f'partitioned swap pool for fp16 params not initialized'
         assert len(dst_fp16_params) == len(src_fp32_params), \
         f'mismatch in number of fp16 params {len(dst_fp16_params)} and fp32 params {len(src_fp32_params)}'
 
-        fp16_swap_paths = self._get_swap_paths(dst_fp16_params, must_exist=True)
-        self.synchronize_writes()
+        fp16_swap_paths = self._get_swap_paths(dst_fp16_params, must_exist=True)#调用 _get_swap_paths 方法获取每个 FP16 参数的交换路径，即FP16参数在磁盘中的位置
+        self.synchronize_writes()#确保在此之前的所有写操作均已完成
         self.partitioned_swap_pool.reset()
         for i, fp32_tensor in enumerate(src_fp32_params):
+            # print("i:",i,"fp32_tensor:",fp32_tensor)
+            
             swap_tensor, _ = self.partitioned_swap_pool.insert_tensor(fp32_tensor, fp16_swap_paths[i],
                                                                       self._io_aligned_numel(fp32_tensor.numel()))
+            # dist.barrier()
+            # print("update")
+            # print(swap_tensor)
+            # if i==1:
+            #     exit()
             assert swap_tensor is not None
             dst_fp16_params[i].ds_tensor.status = PartitionedParamStatus.AVAILABLE
 
         self.partitioned_swap_pool.swap_out(self.aio_write_handle)
-
+        # exit()
         for param in dst_fp16_params:
             param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE

@@ -11,6 +11,7 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 #include <cstdlib>
 
 using namespace std;
+int sum=0;
 
 static void _start_aio_thread(std::shared_ptr<struct deepspeed_aio_thread_t> ctxt) { ctxt->run(); }
 
@@ -177,11 +178,18 @@ int deepspeed_io_handle_t::wait()
 {
     assert(_num_pending_ops > 0);
     auto num_completed_ops = 0;
-
+    std::cout<<"需要wait的事件数："<<_num_pending_ops<<endl;
+    std::cout<<"以下是要wait的参数列表:"<<endl;
     while (_num_pending_ops > 0) {
+        auto start = std::chrono::high_resolution_clock::now();
         auto completed_op = _wait_for_aio_work();
-
         if (completed_op->_validate) { completed_op->validate(); }
+        if(completed_op->_filename=="/media/user/nvme0/zero_stage_3/float16params/rank0/0_param.tensor.swp")
+            sum=0;
+        if(completed_op->_read_op)std::cout<<"read  ";
+        else std::cout<<"write  ";
+        std::cout<<completed_op->_filename<<endl;
+        std::cout<<"文件大小为："<<completed_op->_file_num_bytes<<endl;
 
         completed_op->finish();
 
@@ -189,8 +197,13 @@ int deepspeed_io_handle_t::wait()
 
         --_num_pending_ops;
         ++num_completed_ops;
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        std::cout<<"等待该参数的时间为："<<elapsed.count()*1000000 << " 微秒" << std::endl;
+        sum+=elapsed.count()*1000000;
+        if(completed_op->_filename=="/media/user/nvme0/zero_stage_3/float16params/rank0/290_param.tensor.swp")
+            std::cout<<"等待0-290参数所需的时间为："<<sum<< " 微秒"<<endl;
     }
-
     return num_completed_ops;
 }
 
