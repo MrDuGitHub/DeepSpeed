@@ -817,6 +817,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         reverse_order_indices = [i for i in range(len(self.fp32_partitioned_groups_flat))]
         reverse_order_indices.reverse()
 
+
+
         next_group = None
         for i in reverse_order_indices:
             self.next_swappable_fp32_partitioned_groups.append(next_group)
